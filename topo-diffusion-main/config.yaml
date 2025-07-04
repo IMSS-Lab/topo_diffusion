@@ -1,0 +1,38 @@
+# Default model configuration
+
+# Model architecture parameters
+model:
+  node_feature_dim: 16
+  edge_feature_dim: 8
+  hidden_dim: 256
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.1
+  condition_dim: 32
+
+# Diffusion process parameters
+diffusion:
+  num_timesteps: 1000
+  beta_schedule: "linear"
+  beta_start: 0.0001
+  beta_end: 0.02
+
+# Conditioning parameters
+conditioning:
+  topological:
+    enabled: true
+    weight: 1.0
+  stability:
+    enabled: true
+    weight: 1.0
+  sustainability:
+    enabled: true
+    weight: 1.0
+
+# Loss function weights
+loss_weights:
+  diffusion: 1.0
+  topological: 0.5
+  stability: 0.5
+  sustainability: 0.5
+  validity: 0.5
