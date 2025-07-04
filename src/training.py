@@ -24,6 +24,10 @@ from model import CrystalGraphDiffusionModel, DiffusionProcess
 from data import CrystalGraphDataset, CrystalGraphCollator, CrystalGraphConverter
 from utils import load_structure_from_file, save_structure_to_file, calculate_sustainability_metrics
 
+from model import CrystalGraphDiffusionModel, DiffusionProcess
+from data import CrystalGraphDataset, CrystalGraphCollator, CrystalGraphConverter
+from utils import load_structure_from_file, save_structure_to_file, calculate_sustainability_metrics
+
 logger = logging.getLogger(__name__)
 
 class DiffusionTrainer:
@@ -613,13 +617,21 @@ class DiffusionTrainer:
             
             # Generate samples
             with torch.no_grad():
-                # Sample from diffusion model
+                # Prepare model_kwargs with graph attributes
+                model_kwargs = {
+                    'edge_index': torch.randint(0, 2, (2, num_nodes * current_batch_size)),
+                    'edge_attr': torch.randn(num_nodes * current_batch_size, 128),
+                    'batch': torch.arange(current_batch_size, device=self.device)
+                }
+                
+                # Compute shape for diffusion sampling
+                shape = (batch_size * num_nodes, self.model.node_feature_dim)
+                
                 samples = self.diffusion.sample(
-                    model=self.model,
-                    batch_size=current_batch_size,
+                    self.model,
+                    shape=shape,
                     device=self.device,
-                    node_feature_dim=self.model.node_feature_dim,
-                    num_nodes=num_nodes,
+                    edge_feature_dim=self.model.edge_feature_dim,
                     condition=condition
                 )
                 
@@ -1223,3 +1235,4 @@ class MaterialValidator:
         logger.info(f"Generated validation report at {output_path}")
         
         return output_path
+

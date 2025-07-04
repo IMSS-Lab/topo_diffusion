@@ -35,6 +35,9 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
+# Initialize logging
+setup_logging("DEBUG")
+
 def download_data(args):
     """
     Download and process JARVIS datasets.
@@ -42,7 +45,6 @@ def download_data(args):
     Args:
         args: Command line arguments
     """
-    setup_logging(args.log_level, os.path.join(args.output_dir, "download_data.log"))
     logger.info("Starting JARVIS data download and processing")
     
     # Create downloader
@@ -189,7 +191,6 @@ def train_model(args):
     Args:
         args: Command line arguments
     """
-    setup_logging(args.log_level, os.path.join(args.checkpoint_dir, "train_model.log"))
     logger.info("Starting model training")
     
     # Load configuration
@@ -371,7 +372,6 @@ def generate_materials(args):
     Args:
         args: Command line arguments
     """
-    setup_logging(args.log_level, os.path.join(args.output_dir, "generate_materials.log"))
     logger.info("Starting material generation")
     
     # Create output directory
@@ -392,27 +392,33 @@ def generate_materials(args):
     hidden_dim = None
     num_layers = 0
     num_heads = None
-    
+    condition_dim = None
+
     for key, value in model_state_dict.items():
         if key == "node_embedding.0.weight":
             node_feature_dim = value.shape[1]
-            hidden_dim = value.shape[0]
+            hidden_dim = value.shape[0]  # [hidden_dim, node_feature_dim]
         elif key == "edge_embedding.0.weight":
             edge_feature_dim = value.shape[1]
+            if hidden_dim is None:
+                hidden_dim = value.shape[0]  # [hidden_dim, edge_feature_dim]
         elif "message_passing_layers" in key and ".weight" in key:
             layer_idx = int(key.split(".")[1])
             num_layers = max(num_layers, layer_idx + 1)
-        elif "attention_layers.0.q_proj.weight" in key:
-            num_heads = hidden_dim // value.shape[0]
+        elif key.startswith("attention_layers.") and key.endswith(".edge_proj.weight"):
+            num_heads = value.shape[0]  # [num_heads, hidden_dim]
+        elif key == "condition_embedding.0.weight":
+            condition_dim = value.shape[1]  # [hidden_dim, condition_dim]
     
-    if None in (node_feature_dim, edge_feature_dim, hidden_dim, num_heads):
+    if None in (node_feature_dim, edge_feature_dim, hidden_dim, num_heads, condition_dim):
         logger.error("Could not infer all model parameters from checkpoint")
         logger.error("Please provide a configuration file with model parameters")
         return None
     
+    # Debug: Print inferred parameters
     logger.info(f"Inferred model parameters: node_feature_dim={node_feature_dim}, "
                f"edge_feature_dim={edge_feature_dim}, hidden_dim={hidden_dim}, "
-               f"num_layers={num_layers}, num_heads={num_heads}")
+               f"num_layers={num_layers}, num_heads={num_heads}, condition_dim={condition_dim}")
     
     # Create model
     model = CrystalGraphDiffusionModel(
@@ -421,12 +427,12 @@ def generate_materials(args):
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         num_heads=num_heads,
-        dropout=0.1,  # Default value
-        condition_dim=32  # Default value
+        dropout=0.1,
+        condition_dim=condition_dim
     )
     
     # Load model weights
-    model.load_state_dict(model_state_dict)
+    model.load_state_dict(model_state_dict, strict=False)
     model.to(args.device)
     model.eval()
     
@@ -521,7 +527,6 @@ def validate_materials(args):
     Args:
         args: Command line arguments
     """
-    setup_logging(args.log_level, os.path.join(args.output_dir, "validate_materials.log"))
     logger.info("Starting material validation")
     
     # Create output directory
@@ -705,3 +710,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

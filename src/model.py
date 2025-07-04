@@ -9,11 +9,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing, global_mean_pool
-from torch_scatter import scatter_mean, scatter_add
+from torch_scatter import scatter_add, scatter_mean
 from typing import Dict, List, Tuple, Optional, Union, Any
 import logging
 import math
 import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +349,11 @@ class EquivariantGraphConv(MessagePassing):
         Returns:
             Updated node features [num_nodes, node_dim]
         """
+        # Flatten node features if needed
+        if x.dim() == 3:
+            batch_size, num_nodes, node_feature_dim = x.shape
+            x = x.view(-1, node_feature_dim)
+            
         # Project node features
         h_nodes = self.node_proj(x)
         
@@ -497,12 +503,7 @@ class CrystalGraphDiffusionModel(nn.Module):
         )
         
         # Time embedding for diffusion process
-        self.time_embedding = nn.Sequential(
-            SinusoidalPositionEmbeddings(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        self.time_embedding = SinusoidalPositionEmbeddings(hidden_dim)
         
         # Condition embedding
         self.condition_embedding = nn.Sequential(
@@ -586,17 +587,31 @@ class CrystalGraphDiffusionModel(nn.Module):
         Returns:
             Tuple of (predicted noise, predicted properties tensor)
         """
+        # Flatten node features if needed
+        if x.dim() == 3:
+            batch_size, num_nodes, node_feature_dim = x.shape
+            x = x.view(-1, node_feature_dim)
+            
         # Embed node features
         h = self.node_embedding(x)
         
         # Embed edge features
         edge_h = self.edge_embedding(edge_attr)
         
-        # Embed timestep
-        time_emb = self.time_embedding(t)
+        # Convert timestep to float and then to integer
+        t = t.float()
+        t = t.long()
+        time_emb = self.time_embedding(t)  # [batch_size, hidden_dim]
+        time_emb = time_emb[batch]   # [num_nodes, hidden_dim]
         
-        # Add time embedding to node features
-        h = h + time_emb[batch]
+        # Debug logging
+        logger.debug(f"h shape: {h.shape}")
+        logger.debug(f"time_emb shape: {time_emb.shape}")
+        logger.debug(f"Adding time embedding")
+        h = h + time_emb
+        
+        # Debug logging
+        logger.debug(f"h shape after adding time embedding: {h.shape}")
         
         # Add conditioning if provided
         if condition is not None:
@@ -608,12 +623,26 @@ class CrystalGraphDiffusionModel(nn.Module):
             # Message passing
             h = self.message_passing_layers[i](h, edge_index, edge_h)
             
+            # Debug logging
+            logger.debug(f"h shape after message passing layer {i+1}: {h.shape}")
+            
             # Attention
             h = self.attention_layers[i](h, edge_index, edge_h, batch)
+            
+            # Debug logging
+            logger.debug(f"h shape after attention layer {i+1}: {h.shape}")
         
         # Predict noise or velocity
         pred_noise = self.output_layers(h)
         
+        # Compute batch_size and num_nodes
+        if x.dim() == 3:
+            batch_size, num_nodes, node_feature_dim = x.shape
+        else:
+            batch_size = 1
+            num_nodes = x.shape[0]
+            node_feature_dim = x.shape[1]
+            
         # Get property dictionary
         prop_dict = self.predict_properties(x, edge_index, edge_attr, batch)
         
@@ -674,6 +703,11 @@ class CrystalGraphDiffusionModel(nn.Module):
         Returns:
             Dictionary of predicted properties
         """
+        # Flatten node features if needed
+        if x.dim() == 3:
+            batch_size, num_nodes, node_feature_dim = x.shape
+            x = x.view(-1, node_feature_dim)
+            
         # Embed node features
         h = self.node_embedding(x)
         
@@ -994,7 +1028,13 @@ class DiffusionProcess:
             Dictionary containing the posterior mean and variance
         """
         # Predict noise
-        pred_noise = model(x_t, t, **model_kwargs)
+        pred_noise, _ = model(
+            x_t,
+            model_kwargs['edge_index'],
+            model_kwargs['edge_attr'],
+            t,
+            model_kwargs['batch']
+        )
         
         # Compute predicted initial sample from noise
         pred_x0 = self.predict_start_from_noise(x_t, t, pred_noise)
@@ -1022,21 +1062,22 @@ class DiffusionProcess:
         noise: torch.Tensor
     ) -> torch.Tensor:
         """
-        Predict x_0 from x_t and predicted noise.
-        
-        Args:
-            x_t: Noisy samples at timestep t [batch_size, ...]
-            t: Timesteps [batch_size]
-            noise: Predicted noise [batch_size, ...]
-            
-        Returns:
-            Predicted initial sample x_0 [batch_size, ...]
+        Predict x_0 from x_t and noise.
         """
-        # Extract diffusion coefficients for these timesteps
-        sqrt_recip_alphas_cumprod_t = extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
-        sqrt_recipm1_alphas_cumprod_t = extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-        
-        # Compute predicted x_0
+        # Ensure t is a tensor of indices with the same batch dimension as x_t
+        t = t.flatten()
+        # Gather the coefficients using the timestep indices
+        sqrt_recip_alphas_cumprod_t = self.sqrt_recip_alphas_cumprod.gather(0, t)
+        sqrt_recipm1_alphas_cumprod_t = self.sqrt_recipm1_alphas_cumprod.gather(0, t)
+        # Expand to match x_t shape
+        sqrt_recip_alphas_cumprod_t = sqrt_recip_alphas_cumprod_t.to(x_t.device).view(-1, 1).expand_as(x_t)
+        sqrt_recipm1_alphas_cumprod_t = sqrt_recipm1_alphas_cumprod_t.to(x_t.device).view(-1, 1).expand_as(x_t)
+        # Log shapes for debugging
+        logger.debug(f"t shape: {t.shape}")
+        logger.debug(f"sqrt_recip_alphas_cumprod_t shape after gather: {sqrt_recip_alphas_cumprod_t.shape}")
+        logger.debug(f"sqrt_recipm1_alphas_cumprod_t shape after gather: {sqrt_recipm1_alphas_cumprod_t.shape}")
+        logger.debug(f"x_t shape: {x_t.shape}")
+        logger.debug(f"noise shape: {noise.shape}")
         return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recipm1_alphas_cumprod_t * noise
     
     def p_sample(
@@ -1079,6 +1120,7 @@ class DiffusionProcess:
         model: nn.Module,
         shape: Tuple[int, ...],
         device: torch.device,
+        edge_feature_dim: int,
         noise: Optional[torch.Tensor] = None,
         clip_denoised: bool = True,
         **model_kwargs
@@ -1090,6 +1132,7 @@ class DiffusionProcess:
             model: Noise prediction model
             shape: Shape of the samples to generate
             device: Device to generate samples on
+            edge_feature_dim: Dimension of edge features
             noise: Optional initial noise [batch_size, ...]
             clip_denoised: Whether to clip the predicted denoised sample
             **model_kwargs: Additional arguments to the model
@@ -1102,6 +1145,53 @@ class DiffusionProcess:
             noise = torch.randn(shape, device=device)
         
         x = noise
+        
+        # Generate graph attributes for diffusion sampling
+        total_nodes, node_feature_dim = shape
+        device = x.device
+        
+        # Compute the number of nodes per graph
+        batch_size = 1
+        num_nodes_per_graph = total_nodes // batch_size
+        
+        # Generate initial noise
+        x = torch.randn(shape, device=device)
+        
+        # Create batch vector
+        batch = torch.arange(batch_size).repeat_interleave(num_nodes_per_graph).to(device)
+        
+        # Generate a fully connected graph for each sample in the batch
+        edge_index_list = []
+        edge_attr_list = []
+        
+        # Create fully connected graph for one sample
+        adj = torch.ones(num_nodes_per_graph, num_nodes_per_graph) - torch.eye(num_nodes_per_graph)
+        edge_index_i = adj.nonzero(as_tuple=False).t()
+        
+        # Offset node indices by the number of nodes in previous samples
+        edge_index_i += 0 * num_nodes_per_graph
+        
+        edge_index_list.append(edge_index_i)
+        # Placeholder edge attributes: zeros
+        edge_attr_list.append(torch.zeros(edge_index_i.shape[1], edge_feature_dim, device=device))
+        
+        edge_index = torch.cat(edge_index_list, dim=1)
+        edge_attr = torch.cat(edge_attr_list, dim=0)
+        
+        model_kwargs = {
+            'edge_index': edge_index,
+            'edge_attr': edge_attr,
+            'batch': batch
+        }
+        
+        # Log shapes
+        logger.debug(f"num_nodes: {num_nodes_per_graph}")
+        logger.debug(f"batch_size: {batch_size}")
+        logger.debug(f"batch vector shape: {batch.shape}")
+        logger.debug(f"x shape: {x.shape}")
+        
+        # Start from pure noise
+        x = torch.randn((num_nodes_per_graph, node_feature_dim), device=device)
         
         # Iterate through all timesteps in reverse order
         for t in tqdm(reversed(range(self.num_timesteps)), desc="Sampling", total=self.num_timesteps):
@@ -1119,10 +1209,9 @@ class DiffusionProcess:
     def sample(
         self,
         model: nn.Module,
-        batch_size: int,
+        shape: Tuple[int, ...],
         device: torch.device,
-        node_feature_dim: int,
-        num_nodes: int,
+        edge_feature_dim: int,
         clip_denoised: bool = True,
         **model_kwargs
     ) -> torch.Tensor:
@@ -1131,19 +1220,17 @@ class DiffusionProcess:
         
         Args:
             model: Noise prediction model
-            batch_size: Number of samples to generate
+            shape: Shape of the samples to generate
             device: Device to generate samples on
-            node_feature_dim: Dimension of node features
-            num_nodes: Number of nodes in each graph
+            edge_feature_dim: Dimension of edge features
             clip_denoised: Whether to clip the predicted denoised sample
             **model_kwargs: Additional arguments to the model
             
         Returns:
-            Generated samples [batch_size, num_nodes, node_feature_dim]
+            Generated samples [batch_size, ...]
         """
-        shape = (batch_size, num_nodes, node_feature_dim)
         return self.p_sample_loop(
-            model, shape, device, clip_denoised=clip_denoised, **model_kwargs
+            model, shape, device, edge_feature_dim, clip_denoised=clip_denoised, **model_kwargs
         )
 
 
@@ -1169,3 +1256,389 @@ def extract(
         res = res[..., None]
     
     return res.expand(broadcast_shape)
+
+class DiffusionProcess:
+    """
+    Diffusion process for crystal graph generation.
+    
+    This class implements the diffusion process for generating crystal structures,
+    including forward and reverse processes.
+    """
+    
+    def __init__(
+        self,
+        num_timesteps: int = 1000,
+        beta_schedule: str = "linear",
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02
+    ):
+        """
+        Initialize the diffusion process.
+        
+        Args:
+            num_timesteps: Number of diffusion timesteps
+            beta_schedule: Schedule for noise level ("linear", "cosine", "quadratic")
+            beta_start: Starting noise level
+            beta_end: Ending noise level
+        """
+        self.num_timesteps = num_timesteps
+        self.beta_schedule = beta_schedule
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        
+        # Set up noise schedule
+        if beta_schedule == "linear":
+            self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        elif beta_schedule == "cosine":
+            self._setup_cosine_schedule(num_timesteps)
+        elif beta_schedule == "quadratic":
+            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_timesteps) ** 2
+        else:
+            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
+        
+        # Compute diffusion parameters
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
+        
+        # Compute diffusion coefficients
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = torch.log(1.0 - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
+        
+        # Compute posterior variance
+        self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        self.posterior_log_variance_clipped = torch.log(
+            torch.cat([self.posterior_variance[1:2], self.posterior_variance[1:]])
+        )
+        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        self.posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod)
+    
+    def _setup_cosine_schedule(self, num_timesteps: int):
+        """
+        Set up cosine noise schedule.
+        
+        Args:
+            num_timesteps: Number of diffusion timesteps
+        """
+        steps = num_timesteps + 1
+        x = torch.linspace(0, num_timesteps, steps)
+        alphas_cumprod = torch.cos(((x / num_timesteps) + 0.008) / 1.008 * math.pi / 2) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        self.betas = torch.clip(betas, 0.0001, 0.9999)
+    
+    def q_sample(
+        self,
+        x_start: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Sample from the forward diffusion process q(x_t | x_0).
+        
+        Args:
+            x_start: Starting point (clean data) [batch_size, ...]
+            t: Timesteps [batch_size]
+            noise: Optional noise to add [batch_size, ...]
+            
+        Returns:
+            Noisy samples x_t [batch_size, ...]
+        """
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        
+        # Get diffusion coefficients for these timesteps
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(
+            self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
+        )
+        
+        # Compute noisy samples
+        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+    
+    def q_posterior_mean_variance(
+        self,
+        x_start: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute the mean and variance of the diffusion posterior q(x_{t-1} | x_t, x_0).
+        
+        Args:
+            x_start: Starting point (clean data) [batch_size, ...]
+            x_t: Noisy samples at timestep t [batch_size, ...]
+            t: Timesteps [batch_size]
+            
+        Returns:
+            Tuple of (posterior_mean, posterior_variance, posterior_log_variance_clipped)
+        """
+        # Extract coefficients for these timesteps
+        posterior_mean_coef1_t = extract(self.posterior_mean_coef1, t, x_start.shape)
+        posterior_mean_coef2_t = extract(self.posterior_mean_coef2, t, x_start.shape)
+        
+        # Compute posterior mean
+        posterior_mean = posterior_mean_coef1_t * x_start + posterior_mean_coef2_t * x_t
+        
+        # Extract posterior variance and log variance
+        posterior_variance_t = extract(self.posterior_variance, t, x_start.shape)
+        posterior_log_variance_clipped_t = extract(
+            self.posterior_log_variance_clipped, t, x_start.shape
+        )
+        
+        return posterior_mean, posterior_variance_t, posterior_log_variance_clipped_t
+    
+    def p_mean_variance(
+        self,
+        model: nn.Module,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        clip_denoised: bool = True,
+        **model_kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute the mean and variance of the diffusion posterior p(x_{t-1} | x_t).
+        
+        Args:
+            model: Noise prediction model
+            x_t: Noisy samples at timestep t [batch_size, ...]
+            t: Timesteps [batch_size]
+            clip_denoised: Whether to clip the predicted denoised sample
+            **model_kwargs: Additional arguments to the model
+            
+        Returns:
+            Dictionary containing the posterior mean and variance
+        """
+        # Predict noise
+        pred_noise, _ = model(
+            x_t,
+            model_kwargs['edge_index'],
+            model_kwargs['edge_attr'],
+            t,
+            model_kwargs['batch']
+        )
+        
+        # Compute predicted initial sample from noise
+        pred_x0 = self.predict_start_from_noise(x_t, t, pred_noise)
+        
+        # Clip predicted sample if requested
+        if clip_denoised:
+            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+        
+        # Compute mean and variance of posterior
+        model_mean, model_variance, model_log_variance = self.q_posterior_mean_variance(
+            x_start=pred_x0, x_t=x_t, t=t
+        )
+        
+        return {
+            "mean": model_mean,
+            "variance": model_variance,
+            "log_variance": model_log_variance,
+            "pred_x0": pred_x0
+        }
+    
+    def predict_start_from_noise(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        noise: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Predict x_0 from x_t and noise.
+        """
+        # Ensure t is a tensor of indices with the same batch dimension as x_t
+        t = t.flatten()
+        # Gather the coefficients using the timestep indices
+        sqrt_recip_alphas_cumprod_t = self.sqrt_recip_alphas_cumprod.gather(0, t)
+        sqrt_recipm1_alphas_cumprod_t = self.sqrt_recipm1_alphas_cumprod.gather(0, t)
+        # Expand to match x_t shape
+        sqrt_recip_alphas_cumprod_t = sqrt_recip_alphas_cumprod_t.to(x_t.device).view(-1, 1).expand_as(x_t)
+        sqrt_recipm1_alphas_cumprod_t = sqrt_recipm1_alphas_cumprod_t.to(x_t.device).view(-1, 1).expand_as(x_t)
+        # Log shapes for debugging
+        logger.debug(f"t shape: {t.shape}")
+        logger.debug(f"sqrt_recip_alphas_cumprod_t shape after gather: {sqrt_recip_alphas_cumprod_t.shape}")
+        logger.debug(f"sqrt_recipm1_alphas_cumprod_t shape after gather: {sqrt_recipm1_alphas_cumprod_t.shape}")
+        logger.debug(f"x_t shape: {x_t.shape}")
+        logger.debug(f"noise shape: {noise.shape}")
+        return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recipm1_alphas_cumprod_t * noise
+    
+    def p_sample(
+        self,
+        model: nn.Module,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        clip_denoised: bool = True,
+        **model_kwargs
+    ) -> torch.Tensor:
+        """
+        Sample from the reverse diffusion process p(x_{t-1} | x_t).
+        
+        Args:
+            model: Noise prediction model
+            x_t: Noisy samples at timestep t [batch_size, ...]
+            t: Timesteps [batch_size]
+            clip_denoised: Whether to clip the predicted denoised sample
+            **model_kwargs: Additional arguments to the model
+            
+        Returns:
+            Samples x_{t-1} [batch_size, ...]
+        """
+        # Compute mean and variance of posterior
+        out = self.p_mean_variance(
+            model, x_t, t, clip_denoised=clip_denoised, **model_kwargs
+        )
+        
+        # Sample from posterior
+        noise = torch.randn_like(x_t)
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))
+        
+        # Compute sample
+        sample = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
+        
+        return sample
+    
+    def p_sample_loop(
+        self,
+        model: nn.Module,
+        shape: Tuple[int, ...],
+        device: torch.device,
+        edge_feature_dim: int,
+        noise: Optional[torch.Tensor] = None,
+        clip_denoised: bool = True,
+        **model_kwargs
+    ) -> torch.Tensor:
+        """
+        Generate samples from the model using the reverse diffusion process.
+        
+        Args:
+            model: Noise prediction model
+            shape: Shape of the samples to generate
+            device: Device to generate samples on
+            edge_feature_dim: Dimension of edge features
+            noise: Optional initial noise [batch_size, ...]
+            clip_denoised: Whether to clip the predicted denoised sample
+            **model_kwargs: Additional arguments to the model
+            
+        Returns:
+            Generated samples [batch_size, ...]
+        """
+        # Initialize with random noise
+        if noise is None:
+            noise = torch.randn(shape, device=device)
+        
+        x = noise
+        
+        # Generate graph attributes for diffusion sampling
+        total_nodes, node_feature_dim = shape
+        device = x.device
+        
+        # Compute the number of nodes per graph
+        batch_size = 1
+        num_nodes_per_graph = total_nodes // batch_size
+        
+        # Generate initial noise
+        x = torch.randn(shape, device=device)
+        
+        # Create batch vector
+        batch = torch.arange(batch_size).repeat_interleave(num_nodes_per_graph).to(device)
+        
+        # Generate a fully connected graph for each sample in the batch
+        edge_index_list = []
+        edge_attr_list = []
+        
+        # Create fully connected graph for one sample
+        adj = torch.ones(num_nodes_per_graph, num_nodes_per_graph) - torch.eye(num_nodes_per_graph)
+        edge_index_i = adj.nonzero(as_tuple=False).t()
+        
+        # Offset node indices by the number of nodes in previous samples
+        edge_index_i += 0 * num_nodes_per_graph
+        
+        edge_index_list.append(edge_index_i)
+        # Placeholder edge attributes: zeros
+        edge_attr_list.append(torch.zeros(edge_index_i.shape[1], edge_feature_dim, device=device))
+        
+        edge_index = torch.cat(edge_index_list, dim=1)
+        edge_attr = torch.cat(edge_attr_list, dim=0)
+        
+        model_kwargs = {
+            'edge_index': edge_index,
+            'edge_attr': edge_attr,
+            'batch': batch
+        }
+        
+        # Log shapes
+        logger.debug(f"num_nodes: {num_nodes_per_graph}")
+        logger.debug(f"batch_size: {batch_size}")
+        logger.debug(f"batch vector shape: {batch.shape}")
+        logger.debug(f"x shape: {x.shape}")
+        
+        # Start from pure noise
+        x = torch.randn((num_nodes_per_graph, node_feature_dim), device=device)
+        
+        # Iterate through all timesteps in reverse order
+        for t in tqdm(reversed(range(self.num_timesteps)), desc="Sampling", total=self.num_timesteps):
+            # Create batch of timesteps
+            t_batch = torch.full((shape[0],), t, device=device, dtype=torch.long)
+            
+            # Sample from reverse diffusion process
+            with torch.no_grad():
+                x = self.p_sample(
+                    model, x, t_batch, clip_denoised=clip_denoised, **model_kwargs
+                )
+        
+        return x
+    
+    def sample(
+        self,
+        model: nn.Module,
+        shape: Tuple[int, ...],
+        device: torch.device,
+        edge_feature_dim: int,
+        clip_denoised: bool = True,
+        **model_kwargs
+    ) -> torch.Tensor:
+        """
+        Generate samples from the model.
+        
+        Args:
+            model: Noise prediction model
+            shape: Shape of the samples to generate
+            device: Device to generate samples on
+            edge_feature_dim: Dimension of edge features
+            clip_denoised: Whether to clip the predicted denoised sample
+            **model_kwargs: Additional arguments to the model
+            
+        Returns:
+            Generated samples [batch_size, ...]
+        """
+        return self.p_sample_loop(
+            model, shape, device, edge_feature_dim, clip_denoised=clip_denoised, **model_kwargs
+        )
+
+
+def extract(
+    arr: torch.Tensor,
+    timesteps: torch.Tensor,
+    broadcast_shape: Tuple[int, ...]
+) -> torch.Tensor:
+    """
+    Extract values from a 1D tensor for a batch of indices.
+    
+    Args:
+        arr: 1D tensor of values to extract from
+        timesteps: Batch of indices into arr
+        broadcast_shape: Shape to broadcast the extracted values to
+        
+    Returns:
+        Tensor of extracted values with shape broadcast_shape
+    """
+    res = arr.to(device=timesteps.device)[timesteps].float()
+    
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    
+    return res.expand(broadcast_shape)
+
